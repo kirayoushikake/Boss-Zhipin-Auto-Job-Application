@@ -30,8 +30,7 @@ from dotenv import load_dotenv
 
 from boss_zhipin.models.job_matcher import extract_keywords_from_text, extract_resume_text
 # LLM_PRESETS / is_llm_configured 住在轻量的 boss_zhipin.providers，
-# 让 PyTauri 的 Config 命令不被 cli.py 的重 import 链拖累
-# （cli 的 vectorization import 会触发 sentence_transformers → torch，3-10s）。
+# 让 PyTauri 的 Config 命令不被 cli.py 的业务 import 链拖累。
 from boss_zhipin.providers import (
     LLM_PRESETS,
     is_llm_configured,

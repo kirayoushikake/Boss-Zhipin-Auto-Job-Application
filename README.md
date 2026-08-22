@@ -104,7 +104,6 @@ uv run python -m boss_zhipin
 | `nodriver` | Chrome CDP 浏览器自动化 |
 | `openai` | 通用 LLM API 调用 |
 | `chromadb` | 向量数据库（简历-岗位语义匹配） |
-| `sentence-transformers` | 文本向量化模型 |
 | `pypdf` | PDF 简历解析 |
 | `python-dotenv` | .env 配置读取 |
 
@@ -114,6 +113,7 @@ uv run python -m boss_zhipin
 2. 使用前建议先 `DRY_RUN=1` 试跑，检查生成的招呼语质量
 3. 本项目仅供个人求职使用，使用浏览器自动化可能违反 BOSS 直聘服务条款
 4. 不要在 `.env` 中提交 API Key 到公开仓库
+5. 简历向量化使用内置本地算法，不会访问 Hugging Face，也不需要下载模型
 
 ## 感谢支持
 

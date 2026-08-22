@@ -1,5 +1,8 @@
 # ADR-005：Phase D 用 pytauri standalone 打独立 .app，双运行模式并存
 
+> 2026-08-23 更新：运行时向量器已改为内置字符 n-gram 实现，Torch 和
+> sentence-transformers 已从依赖中移除。下文关于二者体积的内容保留为当时决策背景。
+
 - **状态**：已采纳
 - **日期**：2026-06-07
 - **决策人**：longsizhuo
@@ -100,12 +103,8 @@
 
 ## 体积
 
-dmg ≈ 1.5GB，大头是 torch（sentence-transformers 的依赖）。已知但暂不处理：
-
-- 换轻量 embedding（如 ONNX 版模型）能砍掉 ~1GB，但要动 vectorization 的
-  召回质量验证，单独立项
-- `standalone` extra 去掉 pytauri-wheel 已省 ~40MB
-- 不能为了体积去掉 RAG——deepseek/claude 模式依赖它
+当前实现已移除 Torch / sentence-transformers，保留本地 RAG，但不再需要下载
+embedding 模型。`standalone` extra 同时继续排除 pytauri-wheel。
 
 ## 后果
 

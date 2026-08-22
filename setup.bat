@@ -36,13 +36,11 @@ echo [安装] 正在安装项目依赖（首次约需 3-5 分钟）...
 uv sync
 if %errorlevel% neq 0 (
     echo [错误] 依赖安装失败
-    echo 国内用户可尝试设置 HuggingFace 镜像后重试：
-    echo   set HF_ENDPOINT=https://hf-mirror.com
-    echo   uv sync
     pause
     exit /b 1
 )
 echo [OK] 依赖安装完成
+echo [OK] 简历向量器为本地内置版本，无需下载 Hugging Face 模型
 
 :: Check .env
 if not exist ".env" (

@@ -34,7 +34,7 @@ $EmbedPy      = Join-Path $PyembedDir 'python\python.exe'
 # ---------- 0. 前置工具链检查 ----------
 # Cargo.lock 在 mac 端用 Cargo >=1.78 生成（lockfile v4），低版本直接
 # "lock file version 4 ... does not understand"。在 step 5 才炸太晚——
-# 已经花了几十分钟拉 torch 和编前端，这里 fail-fast。
+# 已经开始组装嵌入式环境和编前端后再失败太晚，这里 fail-fast。
 $CargoVersionLine = (& cargo --version) 2>$null
 if ($LASTEXITCODE -ne 0 -or -not $CargoVersionLine) {
     throw "找不到 cargo——装 Visual Studio Build Tools + rustup 之后重跑"
@@ -99,7 +99,7 @@ Write-Host "==> 嵌入式 Python: $PyVersion"
 # --break-system-packages：uv 把自己装的 python-build-standalone 标成 PEP 668
 # "externally managed"，默认拒绝 pip 写入。本场景就是要往里写，加 flag 放行。
 # （macOS 的 .sh 没踩到大概是早期 uv 没强制，新版 uv 两边都会拦。）
-Write-Host "==> 安装 boss_zhipin + 依赖到 pyembed（首次会拉 torch，较慢）"
+Write-Host "==> 安装 boss_zhipin + 依赖到 pyembed"
 $env:PYTAURI_STANDALONE = '1'
 uv pip install --exact --compile-bytecode --break-system-packages `
     "--python=$EmbedPy" `

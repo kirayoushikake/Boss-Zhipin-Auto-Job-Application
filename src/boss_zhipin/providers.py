@@ -1,8 +1,7 @@
 """LLM 端点的轻量元数据模块。
 
 **为什么单独抽这个模块**：PyTauri 的 Config 命令 / CLI 帮助只需要"预设列表"
-和"是否配好了"这两个轻东西，从 ``cli`` import 会把 vectorization →
-sentence_transformers → torch（3-10s）整条重链拖进来 → 阻塞 portal loop。
+和"是否配好了"这两个轻东西，不需要从 ``cli`` 引入整条业务链。
 这里只依赖 ``os``，import 是 O(1)。
 
 **配置模型（2026-06 重构）**：不再分 deepseek/chatgpt/claude 三个 provider，

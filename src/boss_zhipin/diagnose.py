@@ -14,7 +14,7 @@ from __future__ import annotations
 
 def main() -> int:
     # 延迟 import：让没装 GUI 可选依赖时 import 本模块不立即炸（diagnostics 只用
-    # 轻量的 env/updates/llm_config/resume_io，不拉 torch）。
+    # 轻量的 env/updates/llm_config/resume_io，不拉浏览器自动化依赖）。
     from boss_zhipin.gui.diagnostics import build_ai_help
 
     print(build_ai_help([]))

@@ -99,8 +99,8 @@ prompt。
 
 ## 端点路径：统一一条路
 
-代码不分 provider，**所有端点都走同一条路**：本地 chroma + sentence-transformers
-召回简历片段（RAG）→ 调端点的 `chat.completions` 生成招呼语。入口统一是
+代码不分 provider，**所有端点都走同一条路**：本地 chroma + 内置字符 n-gram
+向量器召回简历片段（RAG）→ 调端点的 `chat.completions` 生成招呼语。入口统一是
 `generate_letter`，没有按牌子分支。选哪家只是成本 / 中文语感的取舍：
 
 | 维度 | DeepSeek | OpenAI | Claude | 其它（通义/智谱/豆包/Kimi/Ollama …） |
@@ -108,7 +108,7 @@ prompt。
 | 单次调用成本 | 最便宜 | 中 | 偏贵 | 视端点而定 |
 | 适用场景 | 量大、对成本敏感 | 生态成熟 | 在意中文语感、能负担成本 | 国内直连 / 本地跑 |
 
-首次跑都会下载 ~430 MB 的 embedding 模型（all-mpnet-base-v2），跟选哪个端点无关。
+向量器完全在本地运行，不下载模型，也不会访问 Hugging Face。
 
 ## 业务循环主流程
 

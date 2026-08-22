@@ -11,9 +11,8 @@
   ``resume/`` 自然落在那里。
 存进 ``RESUME_PATH`` 的是**绝对路径**，不受之后 chdir 影响。
 
-**不 import ``vectorization``**：那个模块 top-level 拉 sentence_transformers →
-torch，import 一次 3-10 秒，会卡住 portal loop（见 ``tauri.detect_providers``
-的同款告警）。校验"是不是个能读的 PDF"只用轻量的 ``pypdf``。
+**不 import ``vectorization``**：校验"是不是个能读的 PDF"只需要轻量的
+``pypdf``，不应把运行阶段的模块拖进上传接口。
 """
 from __future__ import annotations
 
@@ -26,10 +25,9 @@ from dotenv import set_key
 # 托管副本的落点（CWD 相对，跟 cli.DEFAULT_RESUME_PATH 的 ``resume/`` 对齐）。
 RESUME_DIR = "resume"
 
-# 默认简历路径。**故意不从 ``boss_zhipin.cli`` import**：cli top-level 会拉起
-# vectorization → torch（3-10s），而 ``current_resume`` 在运行页一挂载就被调，
-# 会卡住 portal loop（见 ``tauri.detect_providers`` 同款告警）。这里跟
-# ``cli.DEFAULT_RESUME_PATH`` 保持同值即可。
+# 默认简历路径。**故意不从 ``boss_zhipin.cli`` import**：运行页挂载时只需读
+# 一个路径，不应引入 CLI 和浏览器自动化依赖。这里跟 cli.DEFAULT_RESUME_PATH
+# 保持同值即可。
 DEFAULT_RESUME_PATH = "resume/my_cover.pdf"
 
 

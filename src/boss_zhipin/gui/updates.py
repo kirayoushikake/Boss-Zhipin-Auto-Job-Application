@@ -1,7 +1,7 @@
 """检查 GitHub 上有没有新版本——给 GUI 顶部「有新版」横幅用。
 
-**只提示，不自动下载安装**：standalone .app 体积 ~1.4 GB（嵌入式 Python +
-torch），Tauri updater 没有增量更新，每次发版整包重下不现实。所以这里只做
+**只提示，不自动下载安装**：standalone .app 带嵌入式 Python，Tauri updater
+没有增量更新，每次发版整包重下不现实。所以这里只做
 "查最新 release tag → 比版本号 → 有新版给个下载链接"，下载/安装仍由用户手动
 一步，对大包反而更可控。
 

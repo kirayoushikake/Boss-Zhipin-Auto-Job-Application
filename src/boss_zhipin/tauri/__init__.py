@@ -150,8 +150,8 @@ async def start_run(body: StartRunBody, webview_window: WebviewWindow) -> dict[s
     if not body.config.usr_name.strip():
         raise ValueError(msg("err.need_name"))
 
-    # 简历存在性前置校验：不查的话，缺简历会等 cli import（torch，~10s）跑完才在
-    # run_provider 深处抛 FileNotFoundError，只剩 Progress 面板一行容易错过的
+    # 简历存在性前置校验：不查的话，缺简历会在 run_provider 深处抛
+    # FileNotFoundError，只剩 Progress 面板一行容易错过的
     # [error]，用户感受是"点开始没反应"。尤其 standalone .app 的 CWD 是应用数据
     # 目录，repo 里的 resume/ 不在那儿——这是缺省炸点。这里同步抛 ValueError，
     # pyInvoke 直接 reject，前端 catch 后写进日志面板，秒级可见。current_resume
@@ -370,7 +370,7 @@ async def get_resume() -> dict[str, Optional[dict]]:
     """返回当前简历 ``{resume: {filename, path}}``，没设置 / 文件不在则 ``resume`` 为 null。
 
     运行页一挂载就调，**不能触发重 import**——``resume_io.current_resume``
-    刻意没 import cli/vectorization（torch），保持轻量。
+    刻意不 import CLI 业务链，保持轻量。
     """
     from boss_zhipin.gui.resume_io import current_resume
     return {"resume": current_resume()}

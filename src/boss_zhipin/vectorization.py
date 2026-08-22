@@ -12,22 +12,69 @@
 """
 
 import hashlib
+import math
+import re
+import unicodedata
 from pathlib import Path
 
 import chromadb
-from sentence_transformers import SentenceTransformer
 
-EMBED_MODEL_NAME = "sentence-transformers/all-mpnet-base-v2"
+# 内置字符 n-gram 哈希向量器：不下载模型、不访问 Hugging Face，国内网络和
+# 完全离线环境都能直接加载。版本号进入缓存键；以后调整算法/维度时改版本号，
+# 就不会误读旧 sentence-transformers 向量库或不同维度的 Chroma collection。
+EMBEDDING_BACKEND = "local-char-ngram-v1"
+EMBEDDING_DIMENSIONS = 2048
 COLLECTION_NAME = "resume"
 
-_embedder: SentenceTransformer | None = None
+_WHITESPACE_RE = re.compile(r"\s+")
+_HASH_PERSON = b"boss-vec-v1"
 
 
-def _get_embedder() -> SentenceTransformer:
-    global _embedder
-    if _embedder is None:
-        _embedder = SentenceTransformer(EMBED_MODEL_NAME)
-    return _embedder
+def _normalise_text(text: str) -> str:
+    """统一全/半角、大小写和空白，保证同一文本的向量跨机器稳定。"""
+    return _WHITESPACE_RE.sub(" ", unicodedata.normalize("NFKC", text).lower()).strip()
+
+
+def _encode_text(text: str) -> list[float]:
+    """把中英文文本编码为定长单位向量，全程只用 Python 标准库。"""
+    normalised = _normalise_text(text)
+    vector = [0.0] * EMBEDDING_DIMENSIONS
+    if not normalised:
+        return vector
+
+    feature_count = 0
+    for size in (2, 3, 4):
+        if len(normalised) < size:
+            continue
+        for start in range(len(normalised) - size + 1):
+            gram = normalised[start:start + size]
+            digest = hashlib.blake2b(
+                gram.encode("utf-8"), digest_size=8, person=_HASH_PERSON,
+            ).digest()
+            value = int.from_bytes(digest, "big")
+            index = value % EMBEDDING_DIMENSIONS
+            vector[index] += 1.0 if value & (1 << 63) else -1.0
+            feature_count += 1
+
+    # 极短文本（只有一个字符）也要有可查询的向量。
+    if feature_count == 0:
+        digest = hashlib.blake2b(
+            normalised.encode("utf-8"), digest_size=8, person=_HASH_PERSON,
+        ).digest()
+        value = int.from_bytes(digest, "big")
+        vector[value % EMBEDDING_DIMENSIONS] = 1.0
+
+    norm = math.sqrt(sum(value * value for value in vector))
+    return [value / norm for value in vector] if norm else vector
+
+
+def _encode_texts(texts: list[str]) -> list[list[float]]:
+    return [_encode_text(text) for text in texts]
+
+
+def embedding_cache_id(text: str) -> str:
+    """缓存键同时包含向量器版本，防止复用旧模型生成的向量库。"""
+    return text_hash(f"{EMBEDDING_BACKEND}\0{text}")
 
 
 def text_hash(text: str) -> str:
@@ -52,13 +99,13 @@ def split_text(text: str, chunk_size: int = 1000, chunk_overlap: int = 200) -> l
 
 
 class VectorStore:
-    """Chroma collection wrapper with semantic search over PDF chunks."""
+    """Chroma collection wrapper with local similarity search over PDF chunks."""
 
     def __init__(self, collection: chromadb.Collection):
         self._collection = collection
 
     def search(self, query: str, k: int = 4) -> list[str]:
-        query_embedding = _get_embedder().encode([query]).tolist()
+        query_embedding = _encode_texts([query])
         results = self._collection.query(query_embeddings=query_embedding, n_results=k)
         documents = results.get("documents") or []
         return documents[0] if documents else []
@@ -68,7 +115,7 @@ class VectorStore:
         distance_threshold 默认1.3（经验值，基于 L2 距离，越小越相似）。
         如果所有 chunk 的距离都大于阈值，说明完全不相关，返回 False。
         """
-        query_embedding = _get_embedder().encode([query]).tolist()
+        query_embedding = _encode_texts([query])
         results = self._collection.query(query_embeddings=query_embedding, n_results=1)
         distances = results.get("distances")
         if not distances or not distances[0]:
@@ -79,7 +126,7 @@ class VectorStore:
 
 
 def embed_resume(resume_text: str, base_dir: str = "./vectorstores") -> VectorStore:
-    file_id = text_hash(resume_text)
+    file_id = embedding_cache_id(resume_text)
     persist_dir = Path(base_dir) / file_id
     persist_dir.mkdir(parents=True, exist_ok=True)
 
@@ -95,7 +142,8 @@ def embed_resume(resume_text: str, base_dir: str = "./vectorstores") -> VectorSt
         if not chunks:
             raise ValueError("No text extracted from resume")
 
-        embeddings = _get_embedder().encode(chunks).tolist()
+        print("✅ 使用内置本地向量器，无需下载或访问 Hugging Face")
+        embeddings = _encode_texts(chunks)
         collection = client.create_collection(COLLECTION_NAME)
         collection.add(
             documents=chunks,
