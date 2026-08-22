@@ -114,3 +114,9 @@ uv run python -m boss_zhipin
 2. 使用前建议先 `DRY_RUN=1` 试跑，检查生成的招呼语质量
 3. 本项目仅供个人求职使用，使用浏览器自动化可能违反 BOSS 直聘服务条款
 4. 不要在 `.env` 中提交 API Key 到公开仓库
+
+## 感谢支持
+
+如果这个项目帮到了你，感谢你的支持！
+
+<img src="docs/assets/donation-qr.png" alt="赞赏码" width="420">
