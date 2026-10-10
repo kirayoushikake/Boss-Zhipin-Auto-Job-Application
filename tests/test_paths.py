@@ -15,6 +15,10 @@ from boss_zhipin import paths
 _skip_on_windows = pytest.mark.skipif(
     os.name == "nt", reason="Linux 分支需要 PosixPath，Win 上 Python 3.13+ 禁止实例化"
 )
+_skip_without_desktop_source = pytest.mark.skipif(
+    not (Path(__file__).parent.parent / "src-tauri" / "tauri.conf.json").is_file(),
+    reason="CLI-only distribution lacks desktop source (src-tauri/tauri.conf.json)",
+)
 
 
 class TestIsStandalone:
@@ -51,6 +55,7 @@ class TestAppDataDir:
         monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
         assert paths.app_data_dir() == tmp_path / "xdg" / paths.APP_IDENTIFIER
 
+    @_skip_without_desktop_source
     def test_identifier_matches_tauri_conf(self):
         # APP_IDENTIFIER 必须跟 src-tauri/tauri.conf.json 的 identifier 一致，
         # 否则 .app 的数据目录跟 Tauri 自己（WebView cache 等）的不在一处

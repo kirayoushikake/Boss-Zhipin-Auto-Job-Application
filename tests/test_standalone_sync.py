@@ -12,9 +12,16 @@ import json
 import tomllib
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).parent.parent
 WHEEL_TAURI_DIR = REPO_ROOT / "src" / "boss_zhipin" / "tauri"
 SRC_TAURI_DIR = REPO_ROOT / "src-tauri"
+
+pytestmark = pytest.mark.skipif(
+    not SRC_TAURI_DIR.is_dir(),
+    reason="CLI-only distribution lacks desktop source (src-tauri/)",
+)
 
 
 def test_capabilities_in_sync():

@@ -33,13 +33,21 @@ from boss_zhipin.website_oper import finding_jobs
 log = logging.getLogger(__name__)
 
 
-async def send_response_and_go_back(response: str, resume_image_path: str = "") -> None:
-    """在 BOSS 沟通页发送 ``response``，可选附带图片简历，然后退回到列表。"""
-    await finding_jobs.send_chat_message(response)
+async def send_response_and_go_back(response: str, resume_image_path: str = "") -> bool:
+    """Legacy helper with visible-message confirmation before navigation.
+
+    It remains for imports only; the safe CLI routes real sends through
+    :class:`BatchRunner`, which records the ``sending`` state before invoking
+    this kind of page action.
+    """
+    if not await finding_jobs.send_chat_message(response):
+        return False
     if resume_image_path:
-        await finding_jobs.send_image_message(resume_image_path)
+        if not await finding_jobs.send_image_message(resume_image_path):
+            return False
     await asyncio.sleep(10)
     await finding_jobs.navigate_back()
+    return True
 
 
 async def send_job_descriptions_to_chat(
@@ -55,6 +63,7 @@ async def send_job_descriptions_to_chat(
     min_keyword_match: int = 2,
     min_llm_score: int = 70,
     exclude_keywords: list[str] | None = None,
+    external_llm_authorised: bool = False,
 ) -> None:
     """主循环（async）。
 
@@ -68,6 +77,17 @@ async def send_job_descriptions_to_chat(
     不能拆成多个 ``run_until_complete`` —— nodriver CDP 在事件循环停顿期间
     会进入半死状态，下次 evaluate 直接 hang。详见模块 docstring。
     """
+    # This public legacy loop used to contain an unbounded real-send path.
+    # Keep dry-run diagnostics available for explicit programmatic callers,
+    # but never let it bypass the stateful batch runner for platform writes.
+    if not external_llm_authorised:
+        raise PermissionError("旧流程调用 LLM 前也必须由调用方显式授权")
+    if not dry_run:
+        raise PermissionError(
+            "旧发送循环已停用，防止绕过 SQLite 去重、限额和页面确认；"
+            "请使用 CLI `batch --mode execute`。"
+        )
+
     # audit log（letters.jsonl）那一列的 provider/model 标签——从当前 LLM_* 推。
     # 真实运行时 token / 成本由 generate_letter 里的 telemetry 单独记。
     llm_model = os.getenv("LLM_MODEL", "").strip()
@@ -75,7 +95,10 @@ async def send_job_descriptions_to_chat(
 
     await finding_jobs.open_browser_with_options(url, browser_type)
     _emit_progress("browser_started")
-    await finding_jobs.log_in()
+    if not await finding_jobs.log_in():
+        log.error("登录未完成，旧 dry-run 流程安全停止")
+        _emit_progress("login_failed")
+        return
     _emit_progress("login_ok")
 
     job_index = 1

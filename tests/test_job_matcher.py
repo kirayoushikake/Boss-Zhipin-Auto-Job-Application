@@ -2,7 +2,7 @@
 
 覆盖：
 - 关键词提取/匹配：词边界（短英文词不被子串误报）、中文子串、特殊符号关键词
-- ``llm_match_score``：正常解析、分数钳位、三种 fail-open（缺 key / 调用失败 /
+- ``llm_match_score``：正常解析、分数钳位、三种 fail-closed（缺 key / 调用失败 /
   回复解析不出分数）、telemetry 落盘
 - ``should_apply``：关键词层拒绝、LLM 层通过/拒绝
 """
@@ -103,6 +103,61 @@ class TestKeywordMatch:
         assert not passed
         assert matched == []
 
+    def test_empty_keyword_is_ignored_instead_of_compiling_an_invalid_pattern(self):
+        passed, matched = keyword_match("招聘 Python 后端", ["", "Python"], min_match=1)
+        assert passed is True
+        assert matched == ["Python"]
+
+
+class TestKeywordCache:
+    def test_cache_is_invalidated_when_model_changes(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("LLM_MODEL", "model-a")
+        monkeypatch.setenv("LLM_BASE_URL", "https://example.invalid/v1")
+        calls: list[str] = []
+
+        def fake_extract(_text):
+            calls.append("called")
+            return ["Python"]
+
+        monkeypatch.setattr(job_matcher, "_llm_extract_keywords", fake_extract)
+        assert extract_keywords_from_text("候选人有 Python 经验") == ["Python"]
+        assert extract_keywords_from_text("候选人有 Python 经验") == ["Python"]
+        assert calls == ["called"]
+        monkeypatch.setenv("LLM_MODEL", "model-b")
+        assert extract_keywords_from_text("候选人有 Python 经验") == ["Python"]
+        assert calls == ["called", "called"]
+
+
+def test_vector_gate_uses_configurable_threshold(monkeypatch):
+    seen: dict[str, float] = {}
+
+    class Vector:
+        def check_relevance(self, _jd, *, distance_threshold):
+            seen["threshold"] = distance_threshold
+            return True, 1.7
+
+    monkeypatch.setenv("BOSS_MAX_VECTOR_DISTANCE", "1.72")
+    monkeypatch.setattr(job_matcher, "llm_match_score", lambda *_args: (80, "匹配", False))
+    apply, _details = should_apply(
+        "需要 Python Docker", ["Python", "Docker"], "简历", vectorstore=Vector(),
+    )
+    assert apply is True
+    assert seen["threshold"] == 1.72
+
+    def test_empty_keyword_result_is_not_cached(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        calls: list[str] = []
+
+        def empty_extract(_text):
+            calls.append("called")
+            return []
+
+        monkeypatch.setattr(job_matcher, "_llm_extract_keywords", empty_extract)
+        assert extract_keywords_from_text("候选人有 Python 经验") == []
+        assert extract_keywords_from_text("候选人有 Python 经验") == []
+        assert calls == ["called", "called"]
+
 
 # ---------- llm_match_score ----------
 
@@ -140,35 +195,34 @@ class TestLlmMatchScore:
         score, _, _ = llm_match_score("JD", "简历", [])
         assert score == 100
 
-    def test_fail_open_without_api_key(self, monkeypatch):
-        # conftest 已清空 env；这里再兜一层防本机 .env 经 load_dotenv 漏进来。
-        # 缺 key 时 _build_client 抛 RuntimeError → fail-open 放行（返回 100）。
+    def test_fail_closed_without_api_key(self, monkeypatch):
+        # 缺 key 时必须降级为 0 分，禁止自动发送。
         monkeypatch.delenv("LLM_API_KEY", raising=False)
         score, reason, degraded = llm_match_score("JD", "简历", [])
-        assert score == 100
+        assert score == 0
         assert "未配置" in reason
         assert degraded is True  # fail-open 必须标记降级
 
-    def test_fail_open_on_api_error(self, monkeypatch, fake_client, telemetry_spy):
+    def test_fail_closed_on_api_error(self, monkeypatch, fake_client, telemetry_spy):
         def boom(client, **kwargs):
             raise ConnectionError("network down")
 
         monkeypatch.setattr(job_matcher, "_call_chat_completion", boom)
         score, reason, degraded = llm_match_score("JD", "简历", [])
-        assert score == 100
+        assert score == 0
         assert "评分失败" in reason
         assert degraded is True
         # 失败也要记 telemetry
         assert telemetry_spy[0]["ok"] is False
 
-    def test_fail_open_on_unparseable_reply(self, monkeypatch, fake_client, telemetry_spy):
-        # LLM 没按 "分数: NN" 格式回复 → 必须放行，不能按 0 分静默跳过
+    def test_fail_closed_on_unparseable_reply(self, monkeypatch, fake_client, telemetry_spy):
+        # LLM 没按 "分数: NN" 格式回复 → 按 0 分并禁止自动发送。
         monkeypatch.setattr(
             job_matcher, "_call_chat_completion",
             lambda client, **kwargs: _fake_response("我觉得这个职位很适合你！"),
         )
         score, reason, degraded = llm_match_score("JD", "简历", [])
-        assert score == 100
+        assert score == 0
         assert "解析失败" in reason
         assert degraded is True
 
@@ -209,14 +263,13 @@ class TestShouldApply:
         assert details["score"] == 40
 
     def test_surfaces_scoring_degraded(self, monkeypatch):
-        # 评分 fail-open（返回 degraded=True）→ should_apply 在 details 里带出来，
-        # 让主循环能提示用户"第二层过滤暂时没在跑"。
+        # 评分降级 → should_apply 拒绝自动发送并在 details 里留下原因。
         monkeypatch.setattr(
-            job_matcher, "llm_match_score", lambda jd, resume, kws: (100, "无法评分（LLM 未配置）", True)
+            job_matcher, "llm_match_score", lambda jd, resume, kws: (0, "无法评分（LLM 未配置）", True)
         )
         apply, details = should_apply(
             "招聘 Python 工程师，熟悉 Docker", ["Python", "Docker"], "简历全文",
             min_llm_score=70,
         )
-        assert apply  # fail-open 放行
+        assert not apply
         assert details["scoring_degraded"] is True

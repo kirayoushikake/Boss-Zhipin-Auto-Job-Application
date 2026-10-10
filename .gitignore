@@ -44,6 +44,9 @@
 /vectorstores/
 /logs/
 /chrome_profile/
+/data/*.sqlite3
+/data/*.sqlite3-shm
+/data/*.sqlite3-wal
 /assistant.json
 # skill-creator eval workspaces（每次跑 skill eval 都会产出，不需要提交）
 .claude/skills/**/workspace/
@@ -58,6 +61,9 @@
 
 # 简历 PDF（CLAUDE.md 红线，不能进仓）
 /resume/*.pdf
+# Candidate-specific project evidence is private.  Keep a generic template in
+# the repository, but never commit the filled-in local version.
+/resume/candidate_profile.md
 
 # setuptools editable install 的产物
 *.egg-info/

@@ -33,11 +33,14 @@ def get_task() -> Optional[asyncio.Task]:
     return _task
 
 
-async def _wrap(coro: Awaitable[None]) -> None:
+async def _wrap(coro_factory: Callable[[], Awaitable[None]]) -> None:
     """业务 coroutine 外壳：catch 异常 + emit loop_ended + 清 callback。"""
     try:
         try:
-            await coro
+            # Instantiate only after this wrapper starts. If the task is
+            # cancelled immediately after start_run, eagerly creating the
+            # coroutine here would leak an un-awaited coroutine warning.
+            await coro_factory()
             emit("loop_ended", reason="completed")
         except asyncio.CancelledError:
             emit("loop_ended", reason="cancelled")
@@ -67,7 +70,7 @@ def start_run(
     if is_running():
         raise RuntimeError("a run is already in progress")
     set_emit_callback(on_event)
-    _task = asyncio.create_task(_wrap(coro_factory()))
+    _task = asyncio.create_task(_wrap(coro_factory))
     return _task
 
 

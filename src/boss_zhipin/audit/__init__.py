@@ -60,6 +60,24 @@ def validate_letter(letter: str) -> ValidationResult:
     return ValidationResult(ok=not reasons, reasons=reasons)
 
 
+def validate_letter_grounding(letter: str, resume_text: str) -> ValidationResult:
+    """Minimal, deterministic guard for high-risk factual claims.
+
+    This is not a claim that arbitrary natural-language facts can be proven by
+    string matching.  It blocks a small high-risk class (degrees and explicit
+    years of experience) when the same claim has no evidence in the resume;
+    remaining semantic quality is deliberately routed through review mode.
+    """
+    base = validate_letter(letter)
+    reasons = list(base.reasons)
+    evidence = re.sub(r"\s+", "", resume_text or "")
+    candidate = re.sub(r"\s+", "", letter or "")
+    for claim in re.findall(r"(?:\d{1,2}\+?年(?:工作|开发|经验)|本科|硕士|博士|[一二三四五六七八九十]+年(?:工作|开发|经验))", candidate):
+        if claim not in evidence:
+            reasons.append(f"unsupported_claim:{claim}")
+    return ValidationResult(ok=not reasons, reasons=reasons)
+
+
 def log_attempt(
     *,
     provider: str,

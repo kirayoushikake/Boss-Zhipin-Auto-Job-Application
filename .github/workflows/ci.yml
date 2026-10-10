@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [master]
+    branches: [main]
   pull_request:
-    branches: [master]
+    branches: [main]
 
 # 同一分支并行 push 时取消旧 run，省 CI 配额
 concurrency:
@@ -33,7 +33,7 @@ jobs:
         run: uv python install 3.13
 
       - name: 安装依赖（frozen lockfile）
-        run: uv sync --frozen
+        run: uv sync --frozen --no-group tauri
 
       - name: Smoke import check
         # 没有真测试也能拦下"改名 / 移文件 / import 烂掉"那一类回归。
@@ -91,8 +91,8 @@ jobs:
               exit 1
             fi
           done
-          if git ls-files | grep -qE "^chrome_profile/|^vectorstores/|^logs/"; then
-            echo "❌ 仓库里追踪了 chrome_profile/ vectorstores/ logs/ 之一，应该都在 .gitignore"
+          if git ls-files | grep -qE "^chrome_profile/|^vectorstores/|^logs/|^data/.*\\.sqlite3"; then
+            echo "❌ 仓库里追踪了本地浏览器、向量、日志或 SQLite 状态产物，应该都在 .gitignore"
             exit 1
           fi
           echo "✅ 敏感产物未被追踪"

@@ -13,25 +13,34 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
+from urllib.parse import parse_qs, urlparse, urlunparse
 
 import nodriver as uc
 from nodriver import Config
 
+from boss_zhipin.domain import IdentityConfidence, JobIdentity, JobSnapshot, ResumeShareStatus, SendResult
+
 log = logging.getLogger(__name__)
 
-# 持久化 Chrome profile：第一次手动扫码后 cookie 会留下，之后跑就跳过登录。
-# 可用 BOSS_CHROME_PROFILE 环境变量覆盖路径。
-CHROME_PROFILE_DIR = os.path.abspath(
-    os.environ.get("BOSS_CHROME_PROFILE", "./chrome_profile")
-)
+# Retained for backwards-compatible imports only.  Browser startup must use
+# ``chrome_profile_dir()`` so a configuration change made by the GUI/CLI in
+# this process takes effect immediately instead of being frozen at import.
+CHROME_PROFILE_DIR = os.path.abspath(os.environ.get("BOSS_CHROME_PROFILE", "./chrome_profile"))
 
 _browser: uc.Browser | None = None
 _tab: uc.Tab | None = None
+
+
+def chrome_profile_dir() -> str:
+    """Return the current dedicated profile directory at call time."""
+    return os.path.abspath(os.environ.get("BOSS_CHROME_PROFILE", "./chrome_profile"))
 
 
 def get_tab() -> uc.Tab | None:
@@ -93,6 +102,11 @@ async def _is_logged_in() -> bool:
     return True
 
 
+async def is_logged_in() -> bool:
+    """Public, side-effect-free login check for the batch safety gate."""
+    return await _is_logged_in()
+
+
 async def _wait_url_stable(stable_for: float = 2.0, timeout: float = 30) -> str:
     """等到 tab.url 连续 stable_for 秒不变，避开 BOSS 登录页的重定向抖动。"""
     end = asyncio.get_event_loop().time() + timeout
@@ -116,9 +130,8 @@ async def _wait_url_stable(stable_for: float = 2.0, timeout: float = 30) -> str:
 async def shutdown() -> None:
     """关 Chrome 并清空模块级 ``_browser`` / ``_tab``。
 
-    给 GUI 用——用户点"重置"想从头来一遍时调一次，否则下次
-    ``open_browser_with_options`` 会留旧 Chrome 进程。CLI 不需要：``main.py``
-    退出时 OS 会清理子进程。
+    给 GUI 用——只在用户点“重置”、显式退出或 CDP 已失效时调一次。正常批次
+    之间必须复用同一个控制页，不能把它当作每次搜索前的例行清理。
 
     ``Browser.stop()`` 是同步函数，但本函数声明 ``async`` 是为了让 GUI
     runner 能 ``await shutdown()``（runner 一律 await，sync/async 不混用）。
@@ -213,24 +226,38 @@ async def _start_browser_with_retry(config: Config, attempts: int = 3) -> uc.Bro
 
 
 async def open_browser_with_options(url: str, browser: str) -> None:
-    """启动 Chrome 并打开 url。``browser`` 仅接受 ``"chrome"``。"""
+    """Open *or reuse* one visible Chrome tab for normal-page interaction.
+
+    Repeated BOSS searches must navigate the controlled tab rather than create
+    new windows or recycle the Chrome profile.  Only a dead CDP connection is
+    eligible for teardown/restart.
+    """
     global _browser, _tab
     if browser != "chrome":
         raise NotImplementedError(
             f"browser={browser!r} 不再支持；nodriver 只走 Chrome。"
         )
-    os.makedirs(CHROME_PROFILE_DIR, exist_ok=True)
-    # 起之前先收掉上次没退干净、占着本 profile 的孤儿 Chrome + 清残留锁，
-    # 否则会复现用户实测的 "Failed to connect to browser"（profile 被旧实例锁住）。
-    _reap_profile_chrome(CHROME_PROFILE_DIR)
+    if _browser is not None and _tab is not None:
+        if await _check_cdp_health():
+            log.info("复用现有控制页：%s", _tab.url)
+            await navigate_to(url)
+            return
+        log.warning("现有控制页 CDP 已失效，才会重启专用 Chrome")
+        await shutdown()
+    profile_dir = chrome_profile_dir()
+    os.makedirs(profile_dir, exist_ok=True)
+    # Only a fresh/recovery start clears a stale profile owner.  Doing this on
+    # every search used to close the user's active BOSS page and trigger risky
+    # repeated reloads.
+    _reap_profile_chrome(profile_dir)
     config = Config()
-    config.user_data_dir = CHROME_PROFILE_DIR
+    config.user_data_dir = profile_dir
     config.headless = False
     _browser = await _start_browser_with_retry(config)
 
-    # 持久化 profile 启动时 Chrome 会把上次的 tab 都恢复出来；脚本控制的 tab
-    # 直接放到一个独立的新窗口里，跟历史窗口井水不犯河水，新窗口默认抢焦。
-    _tab = await _browser.get(url, new_window=True)
+    # Keep one dedicated normal browser page.  Subsequent navigation uses its
+    # Tab.get method, so a multi-query batch does not keep opening windows.
+    _tab = await _browser.get(url)
     try:
         await _tab.activate()
         await _tab.bring_to_front()
@@ -242,11 +269,34 @@ async def open_browser_with_options(url: str, browser: str) -> None:
     log.info("页面已稳定，当前URL: %s", stable_url)
 
 
-async def log_in() -> None:
-    """识别登录状态；未登录则点开微信扫码，等用户扫码登录。"""
+async def navigate_to(url: str) -> None:
+    """Navigate the controlled tab through a normal browser page load."""
+    global _tab
+    if _browser is None or _tab is None:
+        raise RuntimeError("浏览器尚未启动")
+    # ``Tab.get`` is supported by the installed nodriver version.  Do not use
+    # Browser.get(new_window=True): that created a new window for every query
+    # and was the direct cause of the earlier refresh/anti-risk-control issue.
+    next_tab = await _tab.get(url)
+    if next_tab is not None:
+        _tab = next_tab
+    try:
+        await _tab.activate()
+        await _tab.bring_to_front()
+    except Exception as exc:  # noqa: BLE001 - cosmetic focus only
+        log.debug("导航后激活 tab 失败: %s", exc)
+    await _wait_url_stable(stable_for=1.0, timeout=30)
+
+
+async def log_in() -> bool:
+    """识别登录状态；未登录则点开微信扫码，等用户扫码登录。
+
+    ``False`` is meaningful.  Callers must never turn a QR timeout into a
+    ``login_ok`` progress event and continue to potentially unsafe actions.
+    """
     if await _is_logged_in():
-        log.info("检测到已登录（profile: %s），跳过扫码", CHROME_PROFILE_DIR)
-        return
+        log.info("检测到已登录（profile: %s），跳过扫码", chrome_profile_dir())
+        return True
 
     cur_url = _tab.url
     log.info("log_in 入口 URL: %s", cur_url)
@@ -276,9 +326,10 @@ async def log_in() -> None:
     while asyncio.get_event_loop().time() < deadline:
         if await _is_logged_in():
             log.info("登录成功！cookie 已写入 profile，下次跑应该不用再扫")
-            return
+            return True
         await asyncio.sleep(2)
     log.warning("登录超时，请确认是否已扫码登录")
+    return False
 
 
 # ---------- JS 评估辅助 ----------
@@ -558,6 +609,173 @@ async def get_job_description_by_index(index: int) -> str | None:
     return jd
 
 
+def _normalise_identity_part(value: str) -> str:
+    return " ".join((value or "").lower().split())
+
+
+def _identity_from_card(data: dict) -> JobIdentity:
+    """Create a conservative identity from visible card attributes.
+
+    A title/company hash is intentionally only *weak*: it is useful for
+    diagnostics but must not authorise automatic sending.
+    """
+    href = str(data.get("href") or "")
+    attr_id = str(data.get("job_id") or "").strip()
+    parsed = urlparse(href)
+    params = parse_qs(parsed.query)
+    url_id = next((params[key][0] for key in ("jobId", "jobid", "job_id") if params.get(key)), "")
+    job_id = attr_id or url_id
+    title = str(data.get("title") or "").strip()
+    company = str(data.get("company") or "").strip()
+    recruiter = str(data.get("recruiter") or "").strip()
+    if job_id:
+        return JobIdentity(
+            key=f"boss-job:{job_id}", confidence=IdentityConfidence.STRONG, job_id=job_id,
+            job_url=href, title=title, company=company, recruiter=recruiter,
+            evidence="job card exposed a job id",
+        )
+    # Current BOSS job cards may expose only a canonical public detail URL
+    # (for example ``/job_detail/<opaque-id>.html``), not a data-jobid.
+    # The opaque path is stable enough to deduplicate the same listing across
+    # search sessions, unlike a title/company fingerprint. Query parameters
+    # are deliberately removed because they are tracking/navigation context.
+    canonical_path = parsed.path.rstrip("/")
+    canonical_host = parsed.netloc.lower()
+    if (
+        canonical_host in {"www.zhipin.com", "zhipin.com"}
+        and re.fullmatch(r"/job_detail/[^/]+\.html", canonical_path, flags=re.IGNORECASE)
+    ):
+        canonical_url = urlunparse((parsed.scheme.lower() or "https", canonical_host, canonical_path, "", "", ""))
+        digest = hashlib.sha256(canonical_url.encode("utf-8")).hexdigest()[:24]
+        return JobIdentity(
+            key=f"boss-url:{digest}", confidence=IdentityConfidence.STRONG, job_url=canonical_url,
+            title=title, company=company, recruiter=recruiter,
+            evidence="job card exposed a canonical BOSS job_detail URL",
+        )
+    if href:
+        digest = hashlib.sha256(href.encode("utf-8")).hexdigest()[:24]
+        return JobIdentity(
+            key=f"boss-url:{digest}", confidence=IdentityConfidence.WEAK, job_url=href,
+            title=title, company=company, recruiter=recruiter,
+            evidence="job card exposed a URL but no stable job id",
+        )
+    basis = "\0".join((_normalise_identity_part(title), _normalise_identity_part(company), _normalise_identity_part(recruiter)))
+    digest = hashlib.sha256(basis.encode("utf-8")).hexdigest()[:24]
+    return JobIdentity(
+        key=f"boss-weak:{digest}", confidence=IdentityConfidence.UNKNOWN,
+        title=title, company=company, recruiter=recruiter,
+        evidence="only visible card text was available",
+    )
+
+
+async def prioritized_job_card_indices(preferred_terms: list[str] | tuple[str, ...], limit: int) -> list[int]:
+    """Return current visible-card indices, with soft company/game ranking.
+
+    This only reads the already rendered normal search page.  A missed keyword
+    never removes a listing; it merely leaves that card behind a visible
+    company/card that matches an ACG/game preference term.  The stable index
+    tie-break preserves BOSS's original ordering.
+    """
+    safe_limit = max(1, min(int(limit), 100))
+    js = """
+    JSON.stringify((() => {
+      const text = (el) => (el && el.innerText || '').trim();
+      return {cards: [...document.querySelectorAll('.job-card-box')].map((card, position) => {
+        const first = (selectors) => {
+          for (const selector of selectors) {
+            const value = text(card.querySelector(selector));
+            if (value) return value;
+          }
+          return '';
+        };
+        return {
+          index: position + 1,
+          company: first(['.company-name','[class*=company-name]','[class*=company]']),
+          title: first(['.job-name','.job-title','[class*=job-name]','[class*=job-title]']),
+          card_text: text(card)
+        };
+      })};
+    })())
+    """
+    data = await _safe_evaluate(js, timeout=5)
+    cards = data.get("cards") if isinstance(data.get("cards"), list) else []
+    terms = [str(term).strip().lower() for term in preferred_terms if str(term).strip()]
+    ranked: list[tuple[int, int]] = []
+    for card in cards:
+        if not isinstance(card, dict):
+            continue
+        try:
+            index = int(card.get("index"))
+        except (TypeError, ValueError):
+            continue
+        text = "\n".join(str(card.get(field) or "") for field in ("company", "title", "card_text")).lower()
+        score = sum(term in text for term in terms)
+        ranked.append((score, index))
+    if not ranked:
+        # Keep the batch runner backwards-compatible with a changing page or
+        # a test double.  The subsequent snapshot read still validates each
+        # card/JD before any LLM call or platform write.
+        return list(range(1, safe_limit + 1))
+    ranked.sort(key=lambda item: (-item[0], item[1]))
+    return [index for _, index in ranked[:safe_limit]]
+
+
+async def get_job_identity_by_index(index: int) -> JobIdentity | None:
+    """Read visible job-card metadata without using undocumented APIs."""
+    js = f"""
+    JSON.stringify((() => {{
+      const cards = document.querySelectorAll('.job-card-box');
+      const card = cards[{index - 1}];
+      if (!card) return {{ok:false, total:cards.length}};
+      const text = (el) => (el && el.innerText || '').trim();
+      const first = (selectors) => {{
+        for (const selector of selectors) {{ const el = card.querySelector(selector); if (text(el)) return text(el); }}
+        return '';
+      }};
+      const link = card.querySelector('a[href]');
+      const jobId = card.getAttribute('data-jobid') || card.getAttribute('data-job-id') ||
+        (link && (link.getAttribute('data-jobid') || link.getAttribute('data-job-id'))) || '';
+      return {{ok:true, href:(link && link.href) || '', job_id:jobId,
+        title:first(['.job-name','.job-title','[class*=job-name]','[class*=job-title]']),
+        company:first(['.company-name','[class*=company-name]','[class*=company]']),
+        recruiter:first(['.boss-name','[class*=boss-name]','[class*=recruiter]']),
+        card_text:text(card)}};
+    }})())
+    """
+    data = await _safe_evaluate(js, timeout=5)
+    if not data.get("ok"):
+        return None
+    return _identity_from_card(data)
+
+
+async def get_job_snapshot_by_index(index: int) -> JobSnapshot | None:
+    """Read card identity, click it, then prove the visible JD changed.
+
+    This is deliberately stricter than the legacy helper: unchanged details
+    are returned as untrusted evidence and block automatic sending upstream.
+    """
+    identity = await get_job_identity_by_index(index)
+    if identity is None:
+        return None
+    before = await _js_wait_text(".job-detail-body", min_len=1, timeout_s=1)
+    jd = await get_job_description_by_index(index)
+    if not jd:
+        return None
+    changed = not before or _normalise_identity_part(before) != _normalise_identity_part(jd)
+    evidence = "JD changed after clicking this card" if changed else "JD text did not change after card click"
+    card = await _safe_evaluate(
+        f"JSON.stringify((() => {{ const cards=document.querySelectorAll('.job-card-box'); const card=cards[{index - 1}]; return {{text:(card && card.innerText || '').trim()}}; }})())",
+        timeout=3,
+    )
+    return JobSnapshot(
+        identity=identity,
+        description=jd,
+        card_text=str(card.get("text") or ""),
+        jd_changed_after_click=changed,
+        jd_evidence=evidence,
+    )
+
+
 async def get_text_by_css(selector: str, timeout: float = 5) -> str | None:
     """通用：返回 CSS 选择器命中元素的 text，找不到返回 None。"""
     try:
@@ -585,15 +803,117 @@ async def wait_for_css(selector: str, timeout: float = 50) -> bool:
     return el is not None
 
 
-async def send_chat_message(text: str) -> None:
-    """把 text 打进 ``#chat-input`` 然后回车发送。"""
+async def send_chat_message(text: str) -> bool:
+    """Type and submit a chat message, then require a visible page echo.
+
+    ``True`` means only that this browser page visibly shows the message after
+    the attempt.  It does not mean the recruiter read it or the server has an
+    externally documented delivery receipt.
+    """
     chat = await _tab.select("#chat-input", timeout=10)
     if not chat:
         raise RuntimeError("chat input (#chat-input) 未找到")
     await chat.send_keys(text)
     await asyncio.sleep(3)
     await chat.send_keys("\n")
-    await asyncio.sleep(1)
+    deadline = asyncio.get_event_loop().time() + 8
+    while asyncio.get_event_loop().time() < deadline:
+        result = await _safe_evaluate(
+            """JSON.stringify((() => {
+              const nodes=[...document.querySelectorAll('[class*=message],[class*=chat]')];
+              const body=nodes.slice(-30).map(x => x.innerText || '').join('\\n');
+              return { visible: body.includes(%s) };
+            })())""" % json.dumps(text),
+            timeout=4,
+        )
+        if result.get("visible"):
+            return True
+        await asyncio.sleep(0.5)
+    return False
+
+
+async def current_chat_matches(identity: JobIdentity) -> tuple[bool, str]:
+    """Use visible chat-page text as a conservative target identity gate."""
+    if not identity.safe_for_auto_send:
+        return False, "岗位身份不是强身份"
+    result = await _safe_evaluate(
+        """JSON.stringify((() => {
+          const nodes=[...document.querySelectorAll('[class*=chat],[class*=conversation],[class*=job]')];
+          return {text:nodes.slice(0,40).map(x => x.innerText || '').join('\\n').slice(0,8000)};
+        })())""",
+        timeout=5,
+    )
+    text = _normalise_identity_part(str(result.get("text") or ""))
+    checks = [part for part in (_normalise_identity_part(identity.title), _normalise_identity_part(identity.company)) if part]
+    if not checks:
+        return False, "聊天页缺少可校验的岗位或公司信息"
+    missing = [part for part in checks if part not in text]
+    if missing:
+        return False, "聊天页未显示预期岗位/公司标识"
+    return True, "聊天页可见岗位/公司标识与岗位卡一致"
+
+
+async def try_share_online_resume() -> ResumeShareStatus:
+    """Best-effort normal-UI resume sharing; never uses private APIs.
+
+    The exact UI is platform-version dependent.  Absence of a visible normal
+    UI control is recorded as not available rather than treated as success.
+    """
+    try:
+        button = await _tab.find("发送简历", best_match=True, timeout=3)
+        if not button:
+            button = await _tab.find("分享简历", best_match=True, timeout=3)
+        if not button:
+            return ResumeShareStatus.NOT_AVAILABLE
+        await button.click()
+        await asyncio.sleep(1)
+        page = await _safe_evaluate(
+            "JSON.stringify({text:document.body ? (document.body.innerText || '').slice(-4000) : ''})", timeout=5,
+        )
+        text = str(page.get("text") or "")
+        if any(token in text for token in ("简历已发送", "简历已分享", "已发送简历")):
+            return ResumeShareStatus.SHARED_CONFIRMED
+        return ResumeShareStatus.UNKNOWN
+    except Exception as exc:  # noqa: BLE001
+        log.warning("尝试通过正常 UI 分享在线简历失败: %s", exc)
+        return ResumeShareStatus.FAILED
+
+
+async def open_and_verify_chat(identity: JobIdentity) -> tuple[bool, str]:
+    """Open normal contact UI and prove the resulting chat target is expected."""
+    clicked = await click_by_xpath("//a[contains(@class, 'op-btn-chat')]", timeout=10)
+    if not clicked:
+        return False, "未找到或无法点击立即沟通按钮"
+    try:
+        continue_btn = await _tab.find("继续沟通", best_match=True, timeout=5)
+        if continue_btn:
+            await continue_btn.click()
+    except Exception:
+        pass
+    if not await wait_for_css("#chat-input", timeout=30):
+        return False, "未进入聊天页面或未出现聊天输入框"
+    return await current_chat_matches(identity)
+
+
+async def read_online_resume_text() -> str | None:
+    """Read only visible resume-page content from the logged-in normal UI."""
+    if _tab is None or not await _is_logged_in():
+        return None
+    # This is a documented web page route, not a hidden backend endpoint.
+    await navigate_to("https://www.zhipin.com/web/geek/resume")
+    js = """
+    JSON.stringify((() => {
+      const selectors=['.resume-container','.resume-content','.geek-resume','[class*=resume]'];
+      let best='';
+      for (const s of selectors) for (const el of document.querySelectorAll(s)) {
+        const t=(el.innerText || '').trim(); if (t.length > best.length) best=t;
+      }
+      return {text:best.slice(0,30000), url:location.href};
+    })())
+    """
+    result = await _safe_evaluate(js, timeout=10)
+    text = _strip_jd_noise(str(result.get("text") or ""))
+    return text if len(text) >= 40 else None
 
 
 async def send_image_message(image_path: str) -> bool:

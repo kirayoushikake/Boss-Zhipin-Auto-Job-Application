@@ -4,13 +4,14 @@
 
 ## 项目是干嘛的
 
-一个 BOSS 直聘自动打招呼脚本：
+一个以安全批次为核心的 BOSS 直聘求职辅助工具：
 
 1. 用 `nodriver` 起一个 Chrome（独立 profile，不动用户日常浏览器）。
 2. 登录 BOSS（第一次扫码，cookie 落地 `chrome_profile/` 之后跳过）。
 3. 在推荐 feed 里挨个抓岗位 JD。
 4. 把 JD + RAG 召回的简历片段塞进 prompt，调 LLM 生成中文招呼语。
-5. 校验招呼语（长度、CJK、黑名单），通过就点"立即沟通"发送，否则只写日志。
+5. 校验招呼语（长度、CJK、黑名单、基础事实约束），仅在当前终端取得 LLM 与
+   BOSS 双重授权后，通过状态机和可见回显验证进行沟通。
 
 **重点**：这是一个**个人求职辅助工具**，不是高频爬虫，不是绕过反爬的研究项目。
 不要写任何"提高发送频率"、"绕过 BOSS 检测的更激进策略"之类的改动。
@@ -22,8 +23,8 @@
   仓库 owner 偏好 commit history 是人的署名。
 - **不要写"提速 / 并发 / 绕反爬"的改动**。BOSS 上的反爬越激进，对真实求职者
   伤害越大；这个脚本不希望成为推手。
-- **不要 mock 浏览器自动化和真 LLM 做"端到端测试"**。这样测出来的东西在生产
-  里 100% 不能用。`finding_jobs.py` 的验证靠手动 `DRY_RUN`，不靠单测。
+- **不要在测试中调用真实 BOSS 或付费 LLM**。浏览器适配层需要 mock/fixture 覆盖
+  安全分支；真实页面兼容性由用户参与的 `acceptance` 向导逐阶段验证。
 - **不要 commit 敏感产物**：`.env` / `assistant.json` / `chrome_profile/` /
   `vectorstores/` / `logs/` / `resume/*.pdf`。所有这些都在 `.gitignore`，CI
   里有 `no-leak` job 兜底检查。
@@ -42,7 +43,11 @@
 .
 ├── main.py                       # 兼容 shim，委托 boss_zhipin.cli（uv run main.py 仍可用）
 ├── src/boss_zhipin/              # 业务代码都在这个可安装 package 里（src/ 布局）
-│   ├── cli.py                    # CLI 入口，env 校验（run_provider 是 CLI/GUI 共用的主循环入口）
+│   ├── cli.py                    # CLI 子命令与授权边界
+│   ├── resume_profile.py          # BOSS/PDF/text 统一 ResumeProfile
+│   ├── domain.py / state_store.py # 岗位身份、状态机、SQLite 去重与验收进度
+│   ├── batch_runner.py            # 串行、安全限额的批次执行器
+│   ├── acceptance.py              # 可恢复的 A–F 验收向导
 │   ├── providers.py              # 轻量元数据：LLM_PRESETS（常用端点快捷）+ is_llm_configured
 │   ├── audit/
 │   │   ├── __init__.py           # validate_letter / log_attempt（招呼语审核）
@@ -55,7 +60,7 @@
 │   ├── vectorization.py          # 简历 PDF → chroma 向量化 + 召回
 │   ├── website_oper/
 │   │   ├── finding_jobs.py       # nodriver 浏览器自动化
-│   │   └── write_response.py     # 主循环：JD → LLM → 校验 → 发送/日志
+│   │   └── write_response.py     # 受限的旧 dry-run 兼容入口
 │   ├── gui/                      # 桌面 App 胶水层（events/runner/log_bridge/env_io/history）
 │   └── tauri/                    # PyTauri 桌面 App（python -m boss_zhipin.tauri）
 ├── tests/                        # pytest 单测，每个核心模块对应一个 test_X.py
@@ -81,12 +86,10 @@
 - 2026-06 重构：移除了具名 provider 路由 + OpenAI Assistants 分支（`openai_assistant.py`
   已删），详见 [`docs/wiki/adr/002-three-providers.md`](docs/wiki/adr/002-three-providers.md) 顶部更新
 
-### sync facade + async impl
-- `finding_jobs.py` 对外是同步 API（`open_browser_with_options` / `log_in` /
-  `select_dropdown_option` ...），内部用 `nodriver` 的 async API + 共享的
-  `uc.loop().run_until_complete()` 桥接
-- 这样 `write_response.py` 和 `main.py` 不需要全部改成 async
-- 改动这一层时小心别破坏 async/sync 边界
+### 单一 async 事件循环
+- `finding_jobs.py` 的浏览器函数均为 async；`cli.py` 对需要浏览器的命令只启动
+  一次 `uc.loop().run_until_complete(...)`，避免 nodriver 跨事件循环失活。
+- 不要把这些函数包回逐调用的同步 facade。
 
 ### `validate_letter` 是必经之路
 - 任何 LLM 生成的招呼语**都要先过 `audit.validate_letter`** 再发送

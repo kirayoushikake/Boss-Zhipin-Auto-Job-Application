@@ -1,122 +1,101 @@
-# BOSS直聘自动投递助手 — 发布包说明
+# BOSS 直聘简历投递助手
 
-## 包内容
+这是一个以 CLI 为主的个人求职辅助工具：它通过 Chrome 的正常可见页面读取 BOSS 在线简历或本地简历，扫描岗位、调用 OpenAI 兼容 LLM 进行匹配与生成招呼语，并在你对当前批次明确授权后才发起沟通。
 
-```
-BOSS_Release/
-└── BossZhiPin_Job_Search/       ← 项目
-    ├── setup.bat                ← Windows 一键安装脚本
-    ├── main.py                  ← 入口
-    ├── pyproject.toml           ← 依赖配置（uv 管理）
-    ├── uv.lock                  ← 锁定的依赖版本
-    ├── .env.example             ← 配置模板
-    ├── README.md                ← 完整使用文档
-    ├── src/boss_zhipin/         ← 核心代码
-    │   ├── cli.py               → CLI 入口（搜索URL、关键词在这改）
-    │   ├── website_oper/
-    │   │   ├── finding_jobs.py  → 浏览器自动化
-    │   │   └── write_response.py → 主循环（抓JD→LLM→发送）
-    │   ├── models/
-    │   │   ├── llm.py           → LLM 调用
-    │   │   ├── prompts.py       → 招呼语 prompt
-    │   │   └── job_matcher.py   → 简历-岗位匹配
-    │   ├── vectorization.py     → 简历向量化
-    │   └── audit/               → 招呼语校验+日志
-    ├── tests/                   ← 单元测试
-    ├── docs/wiki/               ← 技术文档
-    └── scripts/                 ← 工具脚本
-```
+仓库地址：[kirayoushikake/Boss-Zhipin-Auto-Job-Application](https://github.com/kirayoushikake/Boss-Zhipin-Auto-Job-Application)。本 checkout 缺少完整的 `src-tauri/` 与前端构建源码，因此本版本只承诺 CLI；不声称桌面端可构建。
 
+## 安全边界
 
-### 前置条件
-- Python 3.11+
-- uv 包管理器
-- Chrome 浏览器
-- 一个 LLM API Key（DeepSeek 推荐，便宜）
+- 默认 `dry-run`，不会发起 BOSS 沟通或发送简历。
+- 每一次批次都需要在当前终端输入精确的 `YES`，以授权简历/JD 外发到配置的 LLM。
+- `execute` 还会第二次要求授权真实 BOSS 沟通；批次与每日上限默认是 5 和 20。
+- 只使用正常、可见的网页 UI；不读取 Cookie、不调用隐藏接口、不绕过验证码或平台限制。
+- 消息没有可见回显时会记作 `unknown` 并安全停止，绝不自动重发。
+- API Key、Chrome profile、SQLite 状态库、日志、向量缓存和简历均被 Git 忽略。不要把真实 Key 粘贴到命令行、日志或公开仓库；若曾泄露，请立即在服务商后台轮换。
 
-### 步骤
+## Windows 快速开始
 
-**1. 安装 Python + uv（一次性）**
+在 PowerShell 中执行：
 
 ```powershell
-# Python: https://www.python.org/downloads/ (勾选 Add to PATH)
-# uv:
-powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
+cd "E:\a办公\简历\BOSS直聘简历投递助手"
+Copy-Item .env.example .env
+# 用文本编辑器填写 .env：LLM_API_KEY、LLM_BASE_URL=https://api.deepseek.com、LLM_MODEL=deepseek-chat
+python -m uv sync --python 3.13 --no-group tauri
+python -m uv run python -m boss_zhipin doctor
 ```
 
-**2. Clone + 安装依赖**
+不要把真实 API Key 写到 `.env.example`、README 或 PowerShell 历史中。`doctor` 只报告“已配置（已隐藏）”，不会回显密钥。
+
+### 命令
 
 ```powershell
-git clone https://github.com/Seeeeekiro/Boss-Zhipin-Auto-Job-Application
-cd BossZhiPin_Job_Search
-uv sync
+# 检查当前 BOSS 在线简历，首次可能需要手动扫码；只读
+python -m uv run python -m boss_zhipin inspect-resume --resume-source boss
+
+# 本地回退：PDF 或 UTF-8 文本简历
+python -m uv run python -m boss_zhipin inspect-resume --resume-source pdf --resume-path ".\resume\my_cover.pdf"
+
+# 完整的可恢复验收向导 A–F；默认依次检索游戏运营、游戏策划、游戏用户研究
+# 每个真实外部操作都会停下来等待确认，整个验收过程复用同一个可见 Chrome 页面
+python -m uv run python -m boss_zhipin acceptance --city-code 101280600
+
+# 真实页面的模拟批次：仍会要求授权本次 LLM 调用，但不会向 BOSS 写入
+python -m uv run python -m boss_zhipin batch --resume-source boss --queries "游戏运营,游戏策划,游戏用户研究" --city-code 101280600 --batch-limit 5 --mode dry-run
+
+# 仅生成并持久化待人工审核候选，不发消息
+python -m uv run python -m boss_zhipin batch --resume-source boss --mode review
+
+# 真实沟通：会依次要求 LLM 授权和本批 BOSS 写入授权
+python -m uv run python -m boss_zhipin batch --resume-source boss --batch-limit 3 --mode execute
+
+# 查看脱敏历史（不显示完整招呼语）
+python -m uv run python -m boss_zhipin history
 ```
 
-**3. 配置并运行**
+旧的无参数入口现在只显示帮助，不会自动打开浏览器或发送消息。请使用上述明确的子命令。
+
+### 游戏岗位与浏览器会话
+
+默认目标是“游戏运营、游戏策划、游戏用户研究”。`BOSS_PREFER_COMPANY_KEYWORDS`（或 `--prefer-company-keywords`）仅将命中二次元/游戏偏好的公司和岗位卡排在前面，不会排除其他游戏公司。每个搜索词使用同一个正常可见的 Chrome 标签页依次导航；一个连续的 `batch` 或 `acceptance` 进程不会为每个岗位打开、关闭窗口。只有 CDP 已确认失效、或你在 GUI 中明确重置时才重启专用浏览器。
+
+如果在线简历没有展开完整项目材料，可把可核验的项目事实保存在私有的 `resume/candidate_profile.md`（从 [模板](resume/profile_supplement.example.md) 复制）并在 `.env` 设置 `BOSS_PROFILE_SUPPLEMENT_PATH`。此文件会参与匹配、招呼语的事实校验和去重指纹，但被 Git 忽略，不会上传到仓库。
+
+## 验收向导
+
+`acceptance` 持久化 A–F 阶段，因此扫码、人工核对或发送授权中断后可从安全阶段继续：
+
+| 阶段 | 操作 | 是否会写入 BOSS |
+| --- | --- | --- |
+| A | 环境、依赖、配置与 SQLite 检查 | 否 |
+| B | 正常页面登录并只读提取在线简历 | 否 |
+| C | 最多 3 个岗位的身份/JD 对应关系只读扫描 | 否 |
+| D | 真实简历/JD 的 LLM Dry-run | 否 |
+| E | 最多 1 个岗位的真实试投 | 是，须再次授权 |
+| F | 最多 3 个岗位的小批量试投 | 是，须独立授权 |
+
+在没有你的登录、扫码和明确授权时，E/F 不会运行；未实际验证的页面选择器不能视为已通过实站验收。核心代码版本变化后，之前持久化的验收通过记录会失效并要求重新验证。
+
+## 数据位置
+
+- SQLite 状态与去重记录：`data/boss_zhipin.sqlite3`（可用 `BOSS_STATE_DB_PATH` 覆盖）
+- 诊断与 LLM telemetry：`logs/`
+- 本地向量/关键词缓存：`vectorstores/`
+- 专用 Chrome 登录 profile：`chrome_profile/`（可用 `BOSS_CHROME_PROFILE` 覆盖）
+
+这些目录只保存在本机。不要删除 `unknown` 状态来“重试”；先在 BOSS 正常聊天页面手动核对结果。
+
+## 已知限制
+
+- BOSS 页面会变化，在线简历读取、岗位身份识别、消息回显与简历分享选择器必须经当前账号的验收向导实际验证。
+- “页面确认消息回显”只说明当前网页观察到了消息，不等同于招聘方已阅读或回复。
+- “发送简历/分享简历”控件并非所有账号、岗位或页面都提供；`best_effort` 会如实记录不可用/未知，`require_confirmed_share` 在未确认时会停止。
+- 你应自行遵守 BOSS 直聘及所在地区的服务条款和使用限制。
+
+## 测试
 
 ```powershell
-# 复制配置模板
-cp .env.example .env
-
-# 编辑 .env，填这 3 个：
-#   LLM_API_KEY=sk-你的key
-#   LLM_MODEL=deepseek-chat
-#   LLM_BASE_URL=https://api.deepseek.com
-
-# 放简历
-# 把 PDF 简历放到 resume\my_cover.pdf
-
-# 试跑（只生成不发送）
-$env:DRY_RUN="1"
-$env:PYTHONIOENCODING="utf-8"
-uv run python -m boss_zhipin
-
-# 正式跑
-$env:PYTHONIOENCODING="utf-8"
-uv run python -m boss_zhipin
+python -m uv run pytest tests/ -v --tb=short
 ```
 
-##  关键配置位置（也可在env启动之后直接在网页上修改）
-
-| 要改什么 | 在哪改 |
-|----------|--------|
-| 搜索城市 | `src/boss_zhipin/cli.py` 第46行 `city=101280600`（深圳） |
-| 搜索关键词 | `src/boss_zhipin/cli.py` 第46行 `query=计算机` |
-| API Key | `.env` 的 `LLM_API_KEY` |
-| 求职类型 | `.env` 的 `BOSS_LABEL`（实习/校招/社招） |
-| 黑名单 | `.env` 的 `BOSS_EXCLUDE_KEYWORDS` |(例如填写【博士】，则会不投递要求博士的岗位)
-| 自定义招呼语风格 | `.env` 的 `BOSS_LETTER_PROMPT` |
-
-##  各 LLM API Key 申请地址（推荐deepseek）
-
-| 服务商 | 申请地址 | 填写方式 |
-|--------|----------|----------|
-| DeepSeek | https://platform.deepseek.com/api_keys | `LLM_BASE_URL=https://api.deepseek.com` |
-| 通义千问 | https://bailian.console.aliyun.com/ | `LLM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1` |
-| 智谱GLM | https://open.bigmodel.cn/usercenter/apikeys | `LLM_BASE_URL=https://open.bigmodel.cn/api/paas/v4` |
-| OpenAI | https://platform.openai.com/api-keys | 不填 `LLM_BASE_URL`（用默认） |
-| Claude | https://console.anthropic.com/settings/keys | 需要中转或兼容代理 |
-
-##  核心依赖
-
-| 包 | 用途 |
-|----|------|
-| `nodriver` | Chrome CDP 浏览器自动化 |
-| `openai` | 通用 LLM API 调用 |
-| `chromadb` | 向量数据库（简历-岗位语义匹配） |
-| `pypdf` | PDF 简历解析 |
-| `python-dotenv` | .env 配置读取 |
-
-## ⚠️ 注意事项
-
-1. 首次运行需要**微信扫码登录** BOSS 直聘，之后 cookie 持久化在 `chrome_profile/`
-2. 使用前建议先 `DRY_RUN=1` 试跑，检查生成的招呼语质量
-3. 本项目仅供个人求职使用，使用浏览器自动化可能违反 BOSS 直聘服务条款
-4. 不要在 `.env` 中提交 API Key 到公开仓库
-5. 简历向量化使用内置本地算法，不会访问 Hugging Face，也不需要下载模型
-
-## 感谢支持
-
-如果这个项目帮到了你，感谢你的支持！
-
-<img src="docs/assets/donation-qr.png" alt="赞赏码" width="420">
+测试不会调用真实 BOSS，也不会调用付费 LLM。

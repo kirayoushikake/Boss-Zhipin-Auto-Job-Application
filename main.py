@@ -6,4 +6,4 @@
 from boss_zhipin.cli import _cli_main
 
 if __name__ == "__main__":
-    _cli_main()
+    raise SystemExit(_cli_main())

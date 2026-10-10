@@ -15,6 +15,11 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = REPO_ROOT / "scripts" / "set_version.py"
 
+pytestmark = pytest.mark.skipif(
+    not (REPO_ROOT / "src-tauri").is_dir(),
+    reason="CLI-only distribution lacks desktop source (src-tauri/)",
+)
+
 # (相对路径, 是否 JSON)
 CONFIG_FILES = [
     ("pyproject.toml", False),
