@@ -25,7 +25,10 @@ from urllib.parse import parse_qs, urlparse, urlunparse
 import nodriver as uc
 from nodriver import Config
 
-from boss_zhipin.domain import IdentityConfidence, JobIdentity, JobSnapshot, ResumeShareStatus, SendResult
+from boss_zhipin.domain import (
+    ChatOpenResult, IdentityConfidence, JobIdentity, JobSnapshot, MessageConfirmation,
+    ResumeShareStatus, SendResult,
+)
 
 log = logging.getLogger(__name__)
 
@@ -105,6 +108,34 @@ async def _is_logged_in() -> bool:
 async def is_logged_in() -> bool:
     """Public, side-effect-free login check for the batch safety gate."""
     return await _is_logged_in()
+
+
+async def current_account_key() -> str:
+    """Return a stable, privacy-preserving account key from normal visible UI.
+
+    The key is deliberately derived from a visible profile/account URL, never
+    from resume text.  An account that cannot be identified may scan and build
+    review drafts, but cannot enter a real-send batch.
+    """
+    configured = os.getenv("BOSS_ACCOUNT_KEY", "").strip()
+    if configured:
+        return f"configured:{hashlib.sha256(configured.encode('utf-8')).hexdigest()[:32]}"
+    if _tab is None:
+        return ""
+    result = await _safe_evaluate(
+        """JSON.stringify((() => {
+          const attr = document.querySelector('[data-user-id],[data-geek-id],[data-userid]');
+          const direct = attr && (attr.getAttribute('data-user-id') || attr.getAttribute('data-geek-id') || attr.getAttribute('data-userid'));
+          const links = [...document.querySelectorAll('a[href]')].map(a => a.href).filter(h =>
+            /\\/web\\/geek\\/(resume|profile)|\\/geek\\/profile/i.test(h));
+          return {direct: direct || '', href: links[0] || ''};
+        })())""",
+        timeout=5,
+    )
+    source = str(result.get("direct") or result.get("href") or "").strip()
+    if not source:
+        return ""
+    return "boss-account:" + hashlib.sha256(source.encode("utf-8")).hexdigest()[:32]
 
 
 async def _wait_url_stable(stable_for: float = 2.0, timeout: float = 30) -> str:
@@ -762,7 +793,21 @@ async def get_job_snapshot_by_index(index: int) -> JobSnapshot | None:
     if not jd:
         return None
     changed = not before or _normalise_identity_part(before) != _normalise_identity_part(jd)
-    evidence = "JD changed after clicking this card" if changed else "JD text did not change after card click"
+    detail = await _safe_evaluate(
+        """JSON.stringify((() => {
+          const roots=[...document.querySelectorAll('.job-detail,.job-detail-container,[class*=job-detail]')];
+          const text=roots.map(el => (el.innerText || '').trim()).sort((a,b)=>b.length-a.length)[0] || '';
+          return {text:text.slice(0,5000)};
+        })())""",
+        timeout=3,
+    )
+    detail_text = _normalise_identity_part(str(detail.get("text") or ""))
+    expected = [part for part in (_normalise_identity_part(identity.title), _normalise_identity_part(identity.company)) if part]
+    identity_matches_detail = bool(expected) and all(part in detail_text for part in expected)
+    evidence = (
+        "JD changed and detail header matches clicked card" if changed and identity_matches_detail
+        else "JD/detail target evidence is insufficient after card click"
+    )
     card = await _safe_evaluate(
         f"JSON.stringify((() => {{ const cards=document.querySelectorAll('.job-card-box'); const card=cards[{index - 1}]; return {{text:(card && card.innerText || '').trim()}}; }})())",
         timeout=3,
@@ -773,6 +818,7 @@ async def get_job_snapshot_by_index(index: int) -> JobSnapshot | None:
         card_text=str(card.get("text") or ""),
         jd_changed_after_click=changed,
         jd_evidence=evidence,
+        identity_matches_detail=identity_matches_detail,
     )
 
 
@@ -803,33 +849,79 @@ async def wait_for_css(selector: str, timeout: float = 50) -> bool:
     return el is not None
 
 
-async def send_chat_message(text: str) -> bool:
-    """Type and submit a chat message, then require a visible page echo.
+def confirm_new_outgoing_message(before: list[dict], after: list[dict], text: str) -> MessageConfirmation:
+    """Pure confirmation matcher used by browser fixtures and the live adapter.
 
-    ``True`` means only that this browser page visibly shows the message after
-    the attempt.  It does not mean the recruiter read it or the server has an
-    externally documented delivery receipt.
+    We accept exactly one new leaf outgoing message node with a stable page
+    message id.  Inputs, history, and parent/child container duplicates are
+    excluded by the extractor before this function runs.  Two equal messages
+    are therefore safe: only the new id can confirm the current attempt.
     """
+    previous_ids = {str(node.get("id") or "") for node in before if node.get("id")}
+    wanted = " ".join((text or "").split())
+    candidates = [
+        node for node in after
+        if node.get("id") and node.get("id") not in previous_ids
+        and node.get("outgoing") is True and not node.get("is_input")
+        and " ".join(str(node.get("text") or "").split()) == wanted
+    ]
+    if len(candidates) == 1:
+        return MessageConfirmation(True, evidence=f"new outgoing independent message id={candidates[0]['id']}")
+    if not candidates:
+        return MessageConfirmation(False, error="未观察到新增且独立的本人消息节点")
+    return MessageConfirmation(False, error="观察到多个同文本新增消息节点，结果不唯一")
+
+
+async def _independent_outgoing_message_nodes() -> list[dict]:
+    """Extract only leaf outgoing message records, never general chat text."""
+    result = await _safe_evaluate(
+        """JSON.stringify((() => {
+          const visible = el => { if (!el) return false; const s=getComputedStyle(el), r=el.getBoundingClientRect(); return s.display!=='none' && s.visibility!=='hidden' && r.width>0 && r.height>0; };
+          const idOf = el => el.getAttribute('data-message-id') || el.getAttribute('data-msg-id') || el.getAttribute('data-messageid') || '';
+          const candidates = [...document.querySelectorAll('[data-message-id],[data-msg-id],[data-messageid],[class*="message-item"],[class*="chat-message"]')];
+          const nodes = candidates.filter(el => {
+            const id=idOf(el), cls=(el.className || '').toString().toLowerCase(), dir=(el.getAttribute('data-direction') || '').toLowerCase();
+            const input=el.matches('input,textarea,[contenteditable=true]') || !!el.querySelector('textarea,[contenteditable=true]');
+            const outgoing=dir==='outgoing' || /(^|[-_ ])(self|outgoing|right|send)([-_ ]|$)/.test(cls);
+            return !!id && visible(el) && !input && outgoing;
+          }).filter(el => !candidates.some(other => other !== el && idOf(other) && el.contains(other) && visible(other)));
+          return {nodes:nodes.map(el => ({id:idOf(el), text:(el.innerText || '').trim(), outgoing:true, is_input:false}))};
+        })())""",
+        timeout=5,
+    )
+    raw = result.get("nodes")
+    return [node for node in raw if isinstance(node, dict)] if isinstance(raw, list) else []
+
+
+async def send_chat_message(text: str, identity: JobIdentity | None = None) -> MessageConfirmation:
+    """Attempt one chat write and confirm it with independent page evidence.
+
+    Clicking/Enter and a matching string anywhere in the page are deliberately
+    insufficient.  Missing identity or absent stable message nodes returns an
+    unconfirmed result after the attempt; callers must persist ``unknown``.
+    """
+    if identity is None:
+        return MessageConfirmation(False, error="缺少当前聊天目标身份，禁止把消息回显认定为成功")
+    before_ok, before_evidence = await current_chat_matches(identity)
+    if not before_ok:
+        return MessageConfirmation(False, error=before_evidence)
+    before = await _independent_outgoing_message_nodes()
     chat = await _tab.select("#chat-input", timeout=10)
     if not chat:
         raise RuntimeError("chat input (#chat-input) 未找到")
     await chat.send_keys(text)
-    await asyncio.sleep(3)
+    await asyncio.sleep(0.5)
     await chat.send_keys("\n")
     deadline = asyncio.get_event_loop().time() + 8
     while asyncio.get_event_loop().time() < deadline:
-        result = await _safe_evaluate(
-            """JSON.stringify((() => {
-              const nodes=[...document.querySelectorAll('[class*=message],[class*=chat]')];
-              const body=nodes.slice(-30).map(x => x.innerText || '').join('\\n');
-              return { visible: body.includes(%s) };
-            })())""" % json.dumps(text),
-            timeout=4,
-        )
-        if result.get("visible"):
-            return True
+        after_ok, after_evidence = await current_chat_matches(identity)
+        if not after_ok:
+            return MessageConfirmation(False, error="发送后聊天对象身份不再匹配：" + after_evidence)
+        outcome = confirm_new_outgoing_message(before, await _independent_outgoing_message_nodes(), text)
+        if outcome.confirmed:
+            return MessageConfirmation(True, evidence=before_evidence + "; " + after_evidence + "; " + outcome.evidence)
         await asyncio.sleep(0.5)
-    return False
+    return MessageConfirmation(False, error="发送后未取得独立新增消息证据")
 
 
 async def current_chat_matches(identity: JobIdentity) -> tuple[bool, str]:
@@ -838,8 +930,9 @@ async def current_chat_matches(identity: JobIdentity) -> tuple[bool, str]:
         return False, "岗位身份不是强身份"
     result = await _safe_evaluate(
         """JSON.stringify((() => {
-          const nodes=[...document.querySelectorAll('[class*=chat],[class*=conversation],[class*=job]')];
-          return {text:nodes.slice(0,40).map(x => x.innerText || '').join('\\n').slice(0,8000)};
+          const selectors=['.chat-header','.chat-title','.conversation-header','[class*=chat-header]','[class*=conversation-header]','[class*=job-title]'];
+          const nodes=selectors.flatMap(s => [...document.querySelectorAll(s)]);
+          return {text:nodes.map(x => x.innerText || '').join('\\n').slice(0,4000)};
         })())""",
         timeout=5,
     )
@@ -860,30 +953,34 @@ async def try_share_online_resume() -> ResumeShareStatus:
     UI control is recorded as not available rather than treated as success.
     """
     try:
+        before = await _independent_outgoing_message_nodes()
         button = await _tab.find("发送简历", best_match=True, timeout=3)
         if not button:
             button = await _tab.find("分享简历", best_match=True, timeout=3)
         if not button:
             return ResumeShareStatus.NOT_AVAILABLE
         await button.click()
-        await asyncio.sleep(1)
-        page = await _safe_evaluate(
-            "JSON.stringify({text:document.body ? (document.body.innerText || '').slice(-4000) : ''})", timeout=5,
-        )
-        text = str(page.get("text") or "")
-        if any(token in text for token in ("简历已发送", "简历已分享", "已发送简历")):
-            return ResumeShareStatus.SHARED_CONFIRMED
+        deadline = asyncio.get_event_loop().time() + 6
+        before_ids = {str(node.get("id")) for node in before}
+        while asyncio.get_event_loop().time() < deadline:
+            new = [node for node in await _independent_outgoing_message_nodes() if str(node.get("id")) not in before_ids]
+            # The normal UI can render a resume card rather than text.  It is
+            # accepted only as a new independent outgoing node explicitly
+            # labelled as a resume, never from a toast or old history text.
+            if len(new) == 1 and any(token in str(new[0].get("text") or "") for token in ("简历", "resume")):
+                return ResumeShareStatus.SHARED_CONFIRMED
+            await asyncio.sleep(0.5)
         return ResumeShareStatus.UNKNOWN
     except Exception as exc:  # noqa: BLE001
         log.warning("尝试通过正常 UI 分享在线简历失败: %s", exc)
         return ResumeShareStatus.FAILED
 
 
-async def open_and_verify_chat(identity: JobIdentity) -> tuple[bool, str]:
+async def open_and_verify_chat(identity: JobIdentity) -> ChatOpenResult:
     """Open normal contact UI and prove the resulting chat target is expected."""
     clicked = await click_by_xpath("//a[contains(@class, 'op-btn-chat')]", timeout=10)
     if not clicked:
-        return False, "未找到或无法点击立即沟通按钮"
+        return ChatOpenResult(False, False, "未找到或无法点击立即沟通按钮")
     try:
         continue_btn = await _tab.find("继续沟通", best_match=True, timeout=5)
         if continue_btn:
@@ -891,8 +988,9 @@ async def open_and_verify_chat(identity: JobIdentity) -> tuple[bool, str]:
     except Exception:
         pass
     if not await wait_for_css("#chat-input", timeout=30):
-        return False, "未进入聊天页面或未出现聊天输入框"
-    return await current_chat_matches(identity)
+        return ChatOpenResult(False, True, "已点击立即沟通但未出现聊天输入框")
+    matched, evidence = await current_chat_matches(identity)
+    return ChatOpenResult(matched, True, evidence)
 
 
 async def read_online_resume_text() -> str | None:
@@ -911,9 +1009,14 @@ async def read_online_resume_text() -> str | None:
       return {text:best.slice(0,30000), url:location.href};
     })())
     """
-    result = await _safe_evaluate(js, timeout=10)
-    text = _strip_jd_noise(str(result.get("text") or ""))
-    return text if len(text) >= 40 else None
+    deadline = asyncio.get_event_loop().time() + 15
+    while asyncio.get_event_loop().time() < deadline:
+        result = await _safe_evaluate(js, timeout=5)
+        text = _strip_jd_noise(str(result.get("text") or ""))
+        if len(text) >= 40:
+            return text
+        await asyncio.sleep(0.5)
+    return None
 
 
 async def send_image_message(image_path: str) -> bool:

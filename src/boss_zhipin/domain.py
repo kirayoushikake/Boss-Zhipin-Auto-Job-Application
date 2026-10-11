@@ -25,6 +25,7 @@ class ApplicationStatus(StrEnum):
     ELIGIBLE = "eligible"
     DRAFTED = "drafted"
     PENDING_REVIEW = "pending_review"
+    REVIEW_APPROVED = "review_approved"
     SENDING = "sending"
     CONTACT_CONFIRMED = "contact_confirmed"
     FAILED = "failed"
@@ -52,8 +53,13 @@ ALLOWED_TRANSITIONS: dict[ApplicationStatus, frozenset[ApplicationStatus]] = {
     ApplicationStatus.DISCOVERED: frozenset({ApplicationStatus.EVALUATING, ApplicationStatus.SKIPPED}),
     ApplicationStatus.EVALUATING: frozenset({ApplicationStatus.SKIPPED, ApplicationStatus.ELIGIBLE, ApplicationStatus.FAILED}),
     ApplicationStatus.ELIGIBLE: frozenset({ApplicationStatus.DRAFTED, ApplicationStatus.PENDING_REVIEW, ApplicationStatus.SKIPPED}),
-    ApplicationStatus.DRAFTED: frozenset({ApplicationStatus.PENDING_REVIEW, ApplicationStatus.SENDING, ApplicationStatus.SKIPPED}),
-    ApplicationStatus.PENDING_REVIEW: frozenset({ApplicationStatus.SENDING, ApplicationStatus.SKIPPED}),
+    ApplicationStatus.DRAFTED: frozenset({ApplicationStatus.PENDING_REVIEW, ApplicationStatus.REVIEW_APPROVED, ApplicationStatus.SENDING, ApplicationStatus.SKIPPED}),
+    # A review draft is deliberately not sendable.  It must first receive a
+    # persisted, user-driven approval.  This is also what makes a resumed
+    # process distinguish an approved item from an item merely waiting in the
+    # review queue.
+    ApplicationStatus.PENDING_REVIEW: frozenset({ApplicationStatus.REVIEW_APPROVED, ApplicationStatus.SKIPPED}),
+    ApplicationStatus.REVIEW_APPROVED: frozenset({ApplicationStatus.SENDING, ApplicationStatus.SKIPPED}),
     ApplicationStatus.SENDING: frozenset({ApplicationStatus.CONTACT_CONFIRMED, ApplicationStatus.FAILED, ApplicationStatus.UNKNOWN}),
     # ``skipped`` means no platform write occurred. A later dry-run can
     # safely reconsider it after an explicit local policy/threshold change;
@@ -93,6 +99,9 @@ class JobSnapshot:
     card_text: str = ""
     jd_changed_after_click: bool = False
     jd_evidence: str = ""
+    # Whether the detail header still names the same card target after the
+    # click.  A changed blob of JD text alone can be an old detail panel.
+    identity_matches_detail: bool = False
 
 
 @dataclass(frozen=True)
@@ -117,6 +126,39 @@ class SendResult:
     confirmation_evidence: str = ""
     error: str = ""
     timestamp: str = field(default_factory=utc_now)
+
+
+@dataclass(frozen=True)
+class MessageConfirmation:
+    """Evidence returned by the browser after attempting a chat write.
+
+    ``confirmed`` is intentionally narrower than "text is visible": it is
+    true only when a *new*, independent outgoing message node with a stable
+    page identifier is observed while the intended chat target still matches.
+    Callers must treat every other outcome as unknown and never retry it.
+    """
+
+    confirmed: bool
+    evidence: str = ""
+    error: str = ""
+
+    def __bool__(self) -> bool:
+        """Compatibility for old ``if result`` call sites without false success."""
+        return self.confirmed
+
+
+@dataclass(frozen=True)
+class ChatOpenResult:
+    """Result of pressing the normal-UI contact button.
+
+    BOSS can create or resume a conversation before the chat page finishes
+    rendering.  ``may_have_side_effect`` keeps that ambiguous case out of the
+    retry path.
+    """
+
+    verified: bool
+    may_have_side_effect: bool
+    evidence: str = ""
 
 
 def as_jsonable(value: Any) -> Any:

@@ -102,9 +102,10 @@ def _add_batch_arguments(parser: argparse.ArgumentParser, *, include_mode: bool 
     parser.add_argument("--query", default=os.getenv("BOSS_QUERY", ""), help="单个职位搜索关键词；设置后会覆盖 --queries")
     parser.add_argument(
         "--queries",
-        default=os.getenv("BOSS_QUERIES", "游戏运营,游戏策划,游戏用户研究"),
-        help="逗号分隔的搜索关键词；依次在同一 Chrome 标签页检索",
+        default=os.getenv("BOSS_QUERIES", ""),
+        help="逗号分隔的搜索关键词；为空时根据已确认简历的求职意向建议",
     )
+    parser.add_argument("--preset", choices=("game",), default=os.getenv("BOSS_JOB_PRESET", ""), help="可选搜索预设；game=游戏运营、策划、用户研究")
     parser.add_argument(
         "--prefer-company-keywords",
         default=os.getenv(
@@ -115,12 +116,14 @@ def _add_batch_arguments(parser: argparse.ArgumentParser, *, include_mode: bool 
     )
     parser.add_argument("--city-code", default=os.getenv("BOSS_CITY_CODE", "101280600"), help="BOSS 城市代码")
     parser.add_argument("--scan-limit", type=int, default=_env_int("BOSS_SCAN_LIMIT", 10, 1, 100), help="每个搜索词最多读取岗位卡数（1–100）")
+    parser.add_argument("--total-scan-limit", type=int, default=_env_int("BOSS_TOTAL_SCAN_LIMIT", 0, 0, 300), help="整个批次最多读取岗位卡数；0=每词上限之和")
     parser.add_argument("--batch-limit", type=int, default=_env_int("BOSS_BATCH_LIMIT", 5, 1, 20), help="单批最多真实沟通数（1–20）")
-    parser.add_argument("--daily-limit", type=int, default=_env_int("BOSS_DAILY_LIMIT", 20, 1, 100), help="每日页面确认沟通上限（1–100）")
+    parser.add_argument("--daily-limit", type=int, default=_env_int("BOSS_DAILY_LIMIT", 20, 1, 100), help="每日真实沟通尝试上限（含 unknown，1–100）")
     parser.add_argument("--min-score", type=int, default=_env_int("BOSS_MIN_MATCH_SCORE", 50, 0, 100), help="LLM 匹配最低分（0–100）")
     parser.add_argument("--exclude", default=os.getenv("BOSS_EXCLUDE_KEYWORDS", ""), help="逗号分隔的黑名单关键词")
     parser.add_argument("--resume-delivery", choices=("best_effort", "require_confirmed_share"), default=os.getenv("BOSS_RESUME_DELIVERY", "best_effort"), help="在线简历分享策略")
     parser.add_argument("--delay-seconds", type=float, default=2.0, help="真实沟通之间的最短等待秒数")
+    parser.add_argument("--business-timezone", default=os.getenv("BOSS_BUSINESS_TIMEZONE", "Asia/Shanghai"), help="每日额度的业务时区（默认 Asia/Shanghai）")
     parser.add_argument("--state-db", default=os.getenv("BOSS_STATE_DB_PATH", "data/boss_zhipin.sqlite3"), help="SQLite 状态库路径")
     if include_mode:
         parser.add_argument("--mode", choices=("dry-run", "review", "execute"), default="dry-run", help="默认 dry-run；review 只入待审核；execute 会进行真实沟通")
@@ -143,6 +146,20 @@ def build_parser() -> argparse.ArgumentParser:
     history.add_argument("--state-db", default=os.getenv("BOSS_STATE_DB_PATH", "data/boss_zhipin.sqlite3"))
     acceptance = sub.add_parser("acceptance", help="运行可恢复的 A–F 验收向导")
     _add_batch_arguments(acceptance, include_mode=False)
+    review = sub.add_parser("review", help="查看、批准、拒绝或执行已审核草稿")
+    review_sub = review.add_subparsers(dest="review_command", required=True)
+    review_list = review_sub.add_parser("list", help="列出 pending_review 草稿（不显示完整简历）")
+    review_list.add_argument("--state-db", default=os.getenv("BOSS_STATE_DB_PATH", "data/boss_zhipin.sqlite3"))
+    review_list.add_argument("--limit", type=int, default=50)
+    for action, help_text in (("approve", "批准指定待审核草稿"), ("reject", "拒绝指定待审核草稿")):
+        item = review_sub.add_parser(action, help=help_text)
+        item.add_argument("--job-key", required=True)
+        item.add_argument("--state-db", default=os.getenv("BOSS_STATE_DB_PATH", "data/boss_zhipin.sqlite3"))
+        if action == "reject":
+            item.add_argument("--reason", default="用户拒绝草稿")
+    review_execute = review_sub.add_parser("execute", help="扫描并执行一个已批准草稿；仍需 LIVE_READY 和本次 YES")
+    review_execute.add_argument("--job-key", required=True)
+    _add_batch_arguments(review_execute, include_mode=False)
     return parser
 
 
@@ -158,6 +175,9 @@ def _code_version() -> str:
     critical_files = (
         package_dir / "batch_runner.py",
         package_dir / "state_store.py",
+        package_dir / "domain.py",
+        package_dir / "acceptance.py",
+        package_dir / "cli.py",
         package_dir / "resume_profile.py",
         package_dir / "website_oper" / "finding_jobs.py",
         package_dir / "models" / "job_matcher.py",
@@ -186,9 +206,11 @@ def _make_options(args: argparse.Namespace):
         resume_path=args.resume_path,
         query=args.query,
         queries=queries,
+        preset=args.preset,
         prefer_company_keywords=preferred_company_keywords,
         city_code=args.city_code,
         scan_limit=args.scan_limit,
+        total_scan_limit=args.total_scan_limit,
         batch_limit=args.batch_limit,
         daily_limit=args.daily_limit,
         min_score=args.min_score,
@@ -196,6 +218,8 @@ def _make_options(args: argparse.Namespace):
         mode=getattr(args, "mode", "dry-run"),
         resume_delivery=args.resume_delivery,
         delay_seconds=args.delay_seconds,
+        business_timezone=args.business_timezone,
+        approved_job_key=getattr(args, "job_key", ""),
     )
 
 
@@ -234,8 +258,8 @@ async def _run_batch(args: argparse.Namespace) -> int:
     ensure_llm_configured()
     options = _make_options(args)
     print("\n批次预览")
-    print(f"模式：{options.mode}；简历：{options.resume_source}；搜索：{'、'.join(options.search_queries)} / {options.city_code}")
-    print(f"每个搜索词扫描上限：{options.scan_limit}；真实沟通上限：{options.batch_limit}；每日确认上限：{options.daily_limit}")
+    print(f"模式：{options.mode}；简历：{options.resume_source}；搜索：{'、'.join(options.search_queries) or '从已确认简历求职意向生成'} / {options.city_code}")
+    print(f"每个搜索词扫描上限：{options.scan_limit}；整体扫描上限：{options.total_scan_limit or '每词上限之和'}；真实沟通上限：{options.batch_limit}；每日尝试上限：{options.daily_limit}")
     print(f"公司/品类软优先：{'、'.join(options.prefer_company_keywords) or '无'}（不硬性排除其他游戏公司）")
     print("LLM 将接收本次简历内容与岗位 JD，用于关键词、匹配评分和招呼语生成。")
     if not confirm("是否授权本次外部 LLM 调用？"):
@@ -266,6 +290,30 @@ async def _run_acceptance(args: argparse.Namespace) -> int:
     wizard = AcceptanceWizard(StateStore(args.state_db), options, _code_version())
     await wizard.run()
     return 0
+
+
+def _run_review_command(args: argparse.Namespace) -> int:
+    """Local review mutations never open BOSS or call the LLM."""
+    from boss_zhipin.state_store import StateStore
+
+    store = StateStore(args.state_db)
+    if args.review_command == "list":
+        rows = store.review_items(limit=args.limit)
+        if not rows:
+            print("暂无待审核草稿。")
+            return 0
+        for row in rows:
+            print(f"- {row['job_key']} | {row.get('company') or '(未知公司)'} | {row.get('title') or '(未知岗位)'} | score={row.get('match_score')}\n  草稿：{str(row.get('letter') or '')[:160]}")
+        return 0
+    if args.review_command == "approve":
+        store.approve_review(args.job_key)
+        print("已批准草稿；真实执行仍需 LIVE_READY 与当前终端授权。")
+        return 0
+    if args.review_command == "reject":
+        store.reject_review(args.job_key, reason=args.reason)
+        print("已拒绝草稿；不会进入自动发送候选。")
+        return 0
+    raise ValueError(f"未知 review 动作：{args.review_command}")
 
 
 async def run_provider(
@@ -323,12 +371,17 @@ def _cli_main(argv: Sequence[str] | None = None) -> int:
             from boss_zhipin.state_store import StateStore
             print_history(StateStore(args.state_db), args.limit)
             return 0
+        if args.command == "review" and args.review_command != "execute":
+            return _run_review_command(args)
         # nodriver requires one uninterrupted loop; create it only for a
         # command that can need browser work.
         import nodriver as uc
         if args.command == "inspect-resume":
             return uc.loop().run_until_complete(_inspect_resume(args))
         if args.command == "batch":
+            return uc.loop().run_until_complete(_run_batch(args))
+        if args.command == "review" and args.review_command == "execute":
+            args.mode = "execute"
             return uc.loop().run_until_complete(_run_batch(args))
         if args.command == "acceptance":
             return uc.loop().run_until_complete(_run_acceptance(args))
